@@ -7,54 +7,64 @@
 #include <HTTPClient.h>
 #include <ArduinoJson.h>
 
-// ---------- PINS ----------
-#define TFT_CS    5
-#define TFT_DC    6
-#define TFT_RST   7
-#define TFT_MOSI  10
-#define TFT_SCLK  8
+// ================= PINS =================
+#define TFT_CS     20  // D7
+#define TFT_DC      5  // D3
+#define TFT_RST     6  // D4
+#define TFT_MOSI   10  // D10
+#define TFT_SCLK    8  // D8
 
-#define SW_DISMISS 2   // D0
-#define SW_MENU    4   // D2
-#define SW_UP      21  // D6
-#define SW_DOWN    20  // D7
-#define BUZZER     3   // D1
+#define BUZZER      3  // D1
+#define SW_DISMISS  2  // D0
+#define SW_MENU     4  // D2
+#define SW_UP       7  // D5
+#define SW_DOWN    21  // D6
+#define BATTERY_PIN 9  // D9 (ADC1_CH9)
 
 TFT_eSPI tft = TFT_eSPI();
 WebServer server(80);
 Preferences prefs;
 
-// ---------- WIFI ----------
+// ================= WIFI =================
 const char* ssid     = "YOUR_WIFI";
 const char* password = "YOUR_PASS";
 
-// ---------- LOGIN ----------
+// ================= LOGIN =================
 const char* www_username = "admin";
 const char* www_password = "blare2024";
 
-// ---------- WEATHER ----------
+// ================= WEATHER =================
 const String API_KEY = "YOUR_OPENWEATHER_KEY";
 const String CITY    = "Mumbai,IN";
 
-// ---------- TIME ----------
+// ================= TIME =================
 const char* ntpServer = "pool.ntp.org";
 const long  gmtOffset_sec = 19800;
 const int   daylightOffset_sec = 0;
 
-// ---------- STATE ----------
+// ================= STATE =================
 bool alarmEnabled = false;
 int alarmHour = 7;
 int alarmMinute = 30;
 bool alarmRinging = false;
-int menuState = 0;              // 0=clock, 1=hour, 2=minute, 3=toggle
+int menuState = 0;
 unsigned long lastWeatherFetch = 0;
+unsigned long lastBatteryCheck = 0;
 const unsigned long WEATHER_INTERVAL = 600000;
+const unsigned long BATTERY_INTERVAL = 5000;
 
 String currentTemp = "--";
 String currentCondition = "Loading...";
 String alertText = "";
+float batteryVoltage = 0.0;
+int batteryPercent = 0;
 
-// ---------- HTML ----------
+// Space animation state
+int starX[40], starY[40], starSpeed[40], starBright[40];
+unsigned long lastStarFrame = 0;
+int frameCounter = 0;
+
+// ================= HTML =================
 String getHTMLPage() {
   String html = "<!DOCTYPE html><html><head><meta name='viewport' content='width=device-width,initial-scale=1'>";
   html += "<title>BLARE</title><style>";
@@ -71,6 +81,7 @@ String getHTMLPage() {
   html += "</style></head><body><div class='card'>";
   html += "<h1>BLARE</h1>";
   html += "<div class='status'>Alarm: <span class='" + String(alarmEnabled ? "on" : "off") + "'>" + String(alarmEnabled ? "ON" : "OFF") + "</span></div>";
+  html += "<div class='status'>Battery: " + String(batteryPercent) + "% (" + String(batteryVoltage, 2) + "V)</div>";
   html += "<form action='/set' method='GET'>";
   html += "<div class='row'><label>Alarm Time</label><input type='time' name='time' value='" + String(alarmHour < 10 ? "0" : "") + String(alarmHour) + ":" + String(alarmMinute < 10 ? "0" : "") + String(alarmMinute) + "'></div>";
   html += "<input type='submit' value='SET ALARM'></form>";
@@ -135,6 +146,16 @@ void saveAlarm() {
   prefs.end();
 }
 
+// ================= BATTERY =================
+void readBattery() {
+  int raw = analogRead(BATTERY_PIN);
+  // Divider: two 100k resistors → /2 voltage
+  batteryVoltage = (raw / 4095.0) * 3.3 * 2.0;
+  // LiPo range: 3.2V empty → 4.2V full
+  batteryPercent = constrain(map((int)(batteryVoltage * 100), 320, 420, 0, 100), 0, 100);
+}
+
+// ================= WEATHER =================
 void fetchWeather() {
   if (WiFi.status() != WL_CONNECTED) return;
   HTTPClient http;
@@ -152,48 +173,131 @@ void fetchWeather() {
   http.end();
 }
 
-void drawScreen() {
+// ================= SPACE ANIMATION =================
+void initStars() {
+  randomSeed(analogRead(0));
+  for (int i = 0; i < 40; i++) {
+    starX[i] = random(0, 240);
+    starY[i] = random(0, 320);
+    starSpeed[i] = random(1, 4);
+    starBright[i] = random(80, 255);
+  }
+}
+
+void drawStars() {
+  // Fade old stars (draw dark pixels over them)
+  for (int i = 0; i < 40; i++) {
+    tft.drawPixel(starX[i], starY[i], TFT_BLACK);
+    starY[i] += starSpeed[i];
+    if (starY[i] > 320) {
+      starY[i] = 0;
+      starX[i] = random(0, 240);
+      starSpeed[i] = random(1, 4);
+    }
+    uint16_t color = tft.color565(starBright[i], starBright[i], 255);
+    tft.drawPixel(starX[i], starY[i], color);
+  }
+}
+
+void drawIdleScreen() {
+  struct tm timeinfo;
+  if (!getLocalTime(&timeinfo)) return;
+
+  // Black background only on first frame
+  if (frameCounter == 0) {
+    tft.fillScreen(TFT_BLACK);
+  }
+
+  drawStars();
+
+  // Time on the right side, big
+  char timeStr[10];
+  strftime(timeStr, sizeof(timeStr), "%H:%M", &timeinfo);
+
+  tft.setTextColor(TFT_WHITE, TFT_BLACK);
+  tft.setTextSize(4);
+  tft.setCursor(10, 130);
+  tft.println(timeStr);
+
+  // Seconds small
+  char secStr[4];
+  strftime(secStr, sizeof(secStr), "%S", &timeinfo);
+  tft.setTextSize(2);
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setCursor(200, 145);
+  tft.print(":");
+  tft.print(secStr);
+
+  // Date
+  tft.setTextSize(1);
+  tft.setTextColor(TFT_DARKGREY, TFT_BLACK);
+  tft.setCursor(10, 180);
+  char dateStr[20];
+  strftime(dateStr, sizeof(dateStr), "%a, %d %b %Y", &timeinfo);
+  tft.print(dateStr);
+
+  // Weather + battery bottom
+  tft.setTextColor(TFT_CYAN, TFT_BLACK);
+  tft.setCursor(10, 200);
+  tft.print(currentTemp); tft.print("C  ");
+  tft.setTextColor(TFT_YELLOW, TFT_BLACK);
+  tft.print(currentCondition);
+
+  tft.setTextColor(TFT_GREEN, TFT_BLACK);
+  tft.setCursor(10, 220);
+  tft.print("BAT ");
+  tft.print(batteryPercent);
+  tft.print("%  ");
+
+  tft.setTextColor(alarmEnabled ? TFT_GREEN : TFT_DARKGREY, TFT_BLACK);
+  tft.print("ALM ");
+  if (alarmEnabled) {
+    if (alarmHour < 10) tft.print("0");
+    tft.print(alarmHour);
+    tft.print(":");
+    if (alarmMinute < 10) tft.print("0");
+    tft.print(alarmMinute);
+  } else {
+    tft.print("OFF");
+  }
+
+  if (alertText.length() > 0) {
+    tft.setTextColor(TFT_RED, TFT_BLACK);
+    tft.setCursor(10, 240);
+    tft.print("! "); tft.print(alertText);
+  }
+
+  frameCounter++;
+}
+
+// ================= MENU SCREEN =================
+void drawMenuScreen() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return;
 
   tft.fillScreen(TFT_BLACK);
+  tft.setTextColor(TFT_WHITE);
+  tft.setTextSize(2);
+  tft.setCursor(10, 10);
+  tft.println("SET ALARM");
 
   char timeStr[10];
   strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
-  tft.setTextColor(TFT_WHITE);
   tft.setTextSize(3);
-  tft.setCursor(10, 10);
+  tft.setCursor(10, 50);
+  tft.setTextColor(TFT_CYAN);
   tft.println(timeStr);
 
-  tft.setTextSize(1);
-  tft.setCursor(10, 55);
-  char dateStr[20];
-  strftime(dateStr, sizeof(dateStr), "%a, %d %b %Y", &timeinfo);
-  tft.println(dateStr);
-
-  tft.setCursor(10, 80);
-  tft.setTextColor(TFT_CYAN);
-  tft.print("Temp: "); tft.print(currentTemp); tft.println(" C");
-
-  tft.setCursor(10, 100);
-  tft.setTextColor(TFT_YELLOW);
-  tft.println(currentCondition);
-
-  if (alertText.length() > 0) {
-    tft.setTextColor(TFT_RED);
-    tft.setCursor(10, 125);
-    tft.println("! " + alertText);
-  }
-
-  // Alarm status line — highlights the field being edited
-  tft.setCursor(10, 150);
-  tft.setTextColor(alarmEnabled ? TFT_GREEN : TFT_DARKGREY);
-  tft.print("Alarm ");
+  // Alarm display with highlight
+  tft.setTextSize(4);
+  tft.setCursor(20, 120);
 
   if (menuState == 1) tft.setTextColor(TFT_YELLOW);
   else tft.setTextColor(alarmEnabled ? TFT_GREEN : TFT_DARKGREY);
+  if (alarmHour < 10) tft.print("0");
   tft.print(alarmHour);
 
+  tft.setTextColor(TFT_WHITE);
   tft.print(":");
 
   if (menuState == 2) tft.setTextColor(TFT_YELLOW);
@@ -203,24 +307,31 @@ void drawScreen() {
 
   if (menuState == 3) {
     tft.setTextColor(TFT_YELLOW);
-    tft.print(alarmEnabled ? "  [ON]" : "  [OFF]");
+    tft.setTextSize(2);
+    tft.setCursor(20, 190);
+    tft.print(alarmEnabled ? "ALARM: ON" : "ALARM: OFF");
   }
 
-  // Menu hint
+  tft.setTextSize(1);
   tft.setTextColor(TFT_ORANGE);
-  tft.setCursor(10, 170);
+  tft.setCursor(10, 230);
   switch (menuState) {
-    case 0: tft.print("SW2=MENU"); break;
-    case 1: tft.print("SET HOUR: SW3+ SW4-"); break;
-    case 2: tft.print("SET MIN:  SW3+ SW4-"); break;
-    case 3: tft.print("SW3/SW4=TOGGLE"); break;
+    case 1: tft.print("SW3+ / SW4-   SW2 next"); break;
+    case 2: tft.print("SW3+ / SW4-   SW2 next"); break;
+    case 3: tft.print("SW3/SW4 toggle  SW2 done"); break;
   }
 
   tft.setTextColor(TFT_BLUE);
-  tft.setCursor(10, 190);
-  tft.print("IP: "); tft.print(WiFi.localIP());
+  tft.setCursor(10, 250);
+  tft.print("SW1 exit");
+
+  tft.setTextColor(TFT_DARKGREY);
+  tft.setCursor(10, 300);
+  tft.print("BAT "); tft.print(batteryPercent); tft.print("%  ");
+  tft.print("IP "); tft.print(WiFi.localIP());
 }
 
+// ================= ALARM =================
 void checkAlarm() {
   if (!alarmEnabled || alarmRinging) return;
   struct tm timeinfo;
@@ -246,7 +357,7 @@ void ringAlarm() {
   noTone(BUZZER);     delay(100);
 }
 
-// --- Button helper: returns true only on a fresh press ---
+// ================= BUTTONS =================
 bool pressed(int pin, unsigned long &lastTime) {
   if (digitalRead(pin) == LOW && millis() - lastTime > 250) {
     lastTime = millis();
@@ -258,7 +369,6 @@ bool pressed(int pin, unsigned long &lastTime) {
 void handleButtons() {
   static unsigned long tDismiss = 0, tMenu = 0, tUp = 0, tDown = 0;
 
-  // SW1 — dismiss alarm or exit menu
   if (pressed(SW_DISMISS, tDismiss)) {
     if (alarmRinging) {
       alarmRinging = false;
@@ -266,40 +376,30 @@ void handleButtons() {
     } else if (menuState != 0) {
       menuState = 0;
       saveAlarm();
+      frameCounter = 0;
     }
   }
 
-  // SW2 — cycle menu
   if (pressed(SW_MENU, tMenu) && !alarmRinging) {
     menuState = (menuState + 1) % 4;
     if (menuState == 0) saveAlarm();
+    frameCounter = 0;
   }
 
-  // SW3 — increment
   if (pressed(SW_UP, tUp) && !alarmRinging) {
-    if (menuState == 1) {
-      alarmHour = (alarmHour + 1) % 24;
-    } else if (menuState == 2) {
-      alarmMinute = (alarmMinute + 1) % 60;
-    } else if (menuState == 3) {
-      alarmEnabled = !alarmEnabled;
-      saveAlarm();
-    }
+    if (menuState == 1) alarmHour = (alarmHour + 1) % 24;
+    else if (menuState == 2) alarmMinute = (alarmMinute + 1) % 60;
+    else if (menuState == 3) { alarmEnabled = !alarmEnabled; saveAlarm(); }
   }
 
-  // SW4 — decrement
   if (pressed(SW_DOWN, tDown) && !alarmRinging) {
-    if (menuState == 1) {
-      alarmHour = (alarmHour + 23) % 24;
-    } else if (menuState == 2) {
-      alarmMinute = (alarmMinute + 59) % 60;
-    } else if (menuState == 3) {
-      alarmEnabled = !alarmEnabled;
-      saveAlarm();
-    }
+    if (menuState == 1) alarmHour = (alarmHour + 23) % 24;
+    else if (menuState == 2) alarmMinute = (alarmMinute + 59) % 60;
+    else if (menuState == 3) { alarmEnabled = !alarmEnabled; saveAlarm(); }
   }
 }
 
+// ================= SETUP =================
 void setup() {
   Serial.begin(115200);
 
@@ -308,16 +408,23 @@ void setup() {
   pinMode(SW_UP, INPUT_PULLUP);
   pinMode(SW_DOWN, INPUT_PULLUP);
   pinMode(BUZZER, OUTPUT);
+  pinMode(BATTERY_PIN, INPUT);
+
+  analogReadResolution(12);
+  analogSetAttenuation(ADC_11db);
 
   tft.init();
   tft.setRotation(1);
   tft.fillScreen(TFT_BLACK);
+
+  initStars();
+  loadAlarm();
+
+  // Boot splash
   tft.setTextColor(TFT_WHITE);
   tft.setTextSize(2);
   tft.setCursor(10, 10);
   tft.println("BLARE");
-
-  loadAlarm();
 
   WiFi.begin(ssid, password);
   tft.setTextSize(1);
@@ -341,10 +448,13 @@ void setup() {
   server.on("/toggle", handleToggle);
   server.begin();
 
+  readBattery();
   fetchWeather();
   lastWeatherFetch = millis();
+  lastBatteryCheck = millis();
 }
 
+// ================= LOOP =================
 void loop() {
   server.handleClient();
   handleButtons();
@@ -360,6 +470,19 @@ void loop() {
     lastWeatherFetch = millis();
   }
 
-  drawScreen();
-  delay(100);
+  if (millis() - lastBatteryCheck > BATTERY_INTERVAL) {
+    readBattery();
+    lastBatteryCheck = millis();
+  }
+
+  if (menuState == 0) {
+    if (millis() - lastStarFrame > 80) {
+      drawIdleScreen();
+      lastStarFrame = millis();
+    }
+  } else {
+    drawMenuScreen();
+    delay(150);
+    frameCounter = 0;
+  }
 }
