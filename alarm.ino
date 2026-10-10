@@ -13,8 +13,12 @@
 #define TFT_RST   7
 #define TFT_MOSI  10
 #define TFT_SCLK  8
-#define MX_SWITCH 2
-#define BUZZER    3
+
+#define SW_DISMISS 2   // D0
+#define SW_MENU    4   // D2
+#define SW_UP      21  // D6
+#define SW_DOWN    20  // D7
+#define BUZZER     3   // D1
 
 TFT_eSPI tft = TFT_eSPI();
 WebServer server(80);
@@ -42,6 +46,7 @@ bool alarmEnabled = false;
 int alarmHour = 7;
 int alarmMinute = 30;
 bool alarmRinging = false;
+int menuState = 0;              // 0=clock, 1=hour, 2=minute, 3=toggle
 unsigned long lastWeatherFetch = 0;
 const unsigned long WEATHER_INTERVAL = 600000;
 
@@ -87,6 +92,9 @@ void handleRoot() {
   if (!isAuthenticated()) return;
   server.send(200, "text/html", getHTMLPage());
 }
+
+void saveAlarm();
+void loadAlarm();
 
 void handleSet() {
   if (!isAuthenticated()) return;
@@ -147,10 +155,11 @@ void fetchWeather() {
 void drawScreen() {
   struct tm timeinfo;
   if (!getLocalTime(&timeinfo)) return;
-  char timeStr[10];
-  strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
 
   tft.fillScreen(TFT_BLACK);
+
+  char timeStr[10];
+  strftime(timeStr, sizeof(timeStr), "%H:%M:%S", &timeinfo);
   tft.setTextColor(TFT_WHITE);
   tft.setTextSize(3);
   tft.setCursor(10, 10);
@@ -165,6 +174,7 @@ void drawScreen() {
   tft.setCursor(10, 80);
   tft.setTextColor(TFT_CYAN);
   tft.print("Temp: "); tft.print(currentTemp); tft.println(" C");
+
   tft.setCursor(10, 100);
   tft.setTextColor(TFT_YELLOW);
   tft.println(currentCondition);
@@ -175,19 +185,39 @@ void drawScreen() {
     tft.println("! " + alertText);
   }
 
-  tft.setTextColor(alarmEnabled ? TFT_GREEN : TFT_DARKGREY);
+  // Alarm status line — highlights the field being edited
   tft.setCursor(10, 150);
+  tft.setTextColor(alarmEnabled ? TFT_GREEN : TFT_DARKGREY);
   tft.print("Alarm ");
-  if (alarmEnabled) {
-    tft.print(alarmHour); tft.print(":");
-    if (alarmMinute < 10) tft.print("0");
-    tft.print(alarmMinute);
-  } else {
-    tft.print("OFF");
+
+  if (menuState == 1) tft.setTextColor(TFT_YELLOW);
+  else tft.setTextColor(alarmEnabled ? TFT_GREEN : TFT_DARKGREY);
+  tft.print(alarmHour);
+
+  tft.print(":");
+
+  if (menuState == 2) tft.setTextColor(TFT_YELLOW);
+  else tft.setTextColor(alarmEnabled ? TFT_GREEN : TFT_DARKGREY);
+  if (alarmMinute < 10) tft.print("0");
+  tft.print(alarmMinute);
+
+  if (menuState == 3) {
+    tft.setTextColor(TFT_YELLOW);
+    tft.print(alarmEnabled ? "  [ON]" : "  [OFF]");
+  }
+
+  // Menu hint
+  tft.setTextColor(TFT_ORANGE);
+  tft.setCursor(10, 170);
+  switch (menuState) {
+    case 0: tft.print("SW2=MENU"); break;
+    case 1: tft.print("SET HOUR: SW3+ SW4-"); break;
+    case 2: tft.print("SET MIN:  SW3+ SW4-"); break;
+    case 3: tft.print("SW3/SW4=TOGGLE"); break;
   }
 
   tft.setTextColor(TFT_BLUE);
-  tft.setCursor(10, 175);
+  tft.setCursor(10, 190);
   tft.print("IP: "); tft.print(WiFi.localIP());
 }
 
@@ -204,29 +234,79 @@ void ringAlarm() {
   tft.fillScreen(TFT_RED);
   tft.setTextColor(TFT_WHITE);
   tft.setTextSize(3);
-  tft.setCursor(20, 80);
+  tft.setCursor(20, 60);
   tft.println("WAKE UP");
+  tft.setTextSize(1);
+  tft.setCursor(20, 120);
+  tft.println("Press SW1 to dismiss");
+
   tone(BUZZER, 880);  delay(150);
   noTone(BUZZER);     delay(100);
   tone(BUZZER, 1100); delay(150);
   noTone(BUZZER);     delay(100);
 }
 
-void handleSwitch() {
-  static unsigned long lastPress = 0;
-  if (millis() - lastPress < 300) return;
-  if (digitalRead(MX_SWITCH) == LOW) {
-    lastPress = millis();
+// --- Button helper: returns true only on a fresh press ---
+bool pressed(int pin, unsigned long &lastTime) {
+  if (digitalRead(pin) == LOW && millis() - lastTime > 250) {
+    lastTime = millis();
+    return true;
+  }
+  return false;
+}
+
+void handleButtons() {
+  static unsigned long tDismiss = 0, tMenu = 0, tUp = 0, tDown = 0;
+
+  // SW1 — dismiss alarm or exit menu
+  if (pressed(SW_DISMISS, tDismiss)) {
     if (alarmRinging) {
       alarmRinging = false;
       noTone(BUZZER);
+    } else if (menuState != 0) {
+      menuState = 0;
+      saveAlarm();
+    }
+  }
+
+  // SW2 — cycle menu
+  if (pressed(SW_MENU, tMenu) && !alarmRinging) {
+    menuState = (menuState + 1) % 4;
+    if (menuState == 0) saveAlarm();
+  }
+
+  // SW3 — increment
+  if (pressed(SW_UP, tUp) && !alarmRinging) {
+    if (menuState == 1) {
+      alarmHour = (alarmHour + 1) % 24;
+    } else if (menuState == 2) {
+      alarmMinute = (alarmMinute + 1) % 60;
+    } else if (menuState == 3) {
+      alarmEnabled = !alarmEnabled;
+      saveAlarm();
+    }
+  }
+
+  // SW4 — decrement
+  if (pressed(SW_DOWN, tDown) && !alarmRinging) {
+    if (menuState == 1) {
+      alarmHour = (alarmHour + 23) % 24;
+    } else if (menuState == 2) {
+      alarmMinute = (alarmMinute + 59) % 60;
+    } else if (menuState == 3) {
+      alarmEnabled = !alarmEnabled;
+      saveAlarm();
     }
   }
 }
 
 void setup() {
   Serial.begin(115200);
-  pinMode(MX_SWITCH, INPUT_PULLUP);
+
+  pinMode(SW_DISMISS, INPUT_PULLUP);
+  pinMode(SW_MENU, INPUT_PULLUP);
+  pinMode(SW_UP, INPUT_PULLUP);
+  pinMode(SW_DOWN, INPUT_PULLUP);
   pinMode(BUZZER, OUTPUT);
 
   tft.init();
@@ -267,7 +347,7 @@ void setup() {
 
 void loop() {
   server.handleClient();
-  handleSwitch();
+  handleButtons();
   checkAlarm();
 
   if (alarmRinging) {
@@ -281,5 +361,5 @@ void loop() {
   }
 
   drawScreen();
-  delay(200);
+  delay(100);
 }
